@@ -2,9 +2,26 @@ import PromiseKit
 
 @objc(LKAPI)
 public final class LokiAPI : NSObject {
+    /// Only ever modified from the message processing queue (`OWSBatchMessageProcessor.processingQueue`).
     private static var syncMessageTimestamps: [String:Set<UInt64>] = [:]
-    public static var lastDeviceLinkUpdate: [String:Date] = [:] // Hex encoded public key to date
-    @objc public static var userHexEncodedPublicKeyCache: [String:Set<String>] = [:] // Thread ID to set of user hex encoded public keys
+    
+    public static var _lastDeviceLinkUpdate: [String:Date] = [:]
+    /// A mapping from hex encoded public key to date updated.
+    public static var lastDeviceLinkUpdate: [String:Date] {
+        get { stateQueue.sync { _lastDeviceLinkUpdate } }
+        set { stateQueue.sync { _lastDeviceLinkUpdate = newValue } }
+    }
+    
+    private static var _userHexEncodedPublicKeyCache: [String:Set<String>] = [:]
+    /// A mapping from thread ID to set of user hex encoded public keys.
+    @objc public static var userHexEncodedPublicKeyCache: [String:Set<String>] {
+        get { stateQueue.sync { _userHexEncodedPublicKeyCache } }
+        set { stateQueue.sync { _userHexEncodedPublicKeyCache = newValue } }
+    }
+    
+    private static let stateQueue = DispatchQueue(label: "stateQueue")
+    
+    /// All service node related errors must be handled on this queue to avoid race conditions maintaining e.g. failure counts.
     public static let errorHandlingQueue = DispatchQueue(label: "errorHandlingQueue")
     
     // MARK: Convenience
@@ -12,31 +29,24 @@ public final class LokiAPI : NSObject {
     internal static let userHexEncodedPublicKey = getUserHexEncodedPublicKey()
     
     // MARK: Settings
-    private static let version = "v1"
+    private static let apiVersion = "v1"
     private static let maxRetryCount: UInt = 8
     private static let defaultTimeout: TimeInterval = 20
     private static let longPollingTimeout: TimeInterval = 40
-    private static let receivedMessageHashValuesKey = "receivedMessageHashValuesKey"
-    private static let receivedMessageHashValuesCollection = "receivedMessageHashValuesCollection"
     private static var userIDScanLimit: UInt = 4096
     internal static var powDifficulty: UInt = 4
     public static let defaultMessageTTL: UInt64 = 24 * 60 * 60 * 1000
-    public static let deviceLinkUpdateInterval: TimeInterval = 60
+    public static let deviceLinkUpdateInterval: TimeInterval = 20
     
     // MARK: Types
     public typealias RawResponse = Any
     
-    public enum Error : LocalizedError {
-        /// Only applicable to snode targets as proof of work isn't required for P2P messaging.
-        case proofOfWorkCalculationFailed
-        case messageConversionFailed
+    @objc public class LokiAPIError : NSError { // Not called `Error` for Obj-C interoperablity
         
-        public var errorDescription: String? {
-            switch self {
-            case .proofOfWorkCalculationFailed: return NSLocalizedString("Failed to calculate proof of work.", comment: "")
-            case .messageConversionFailed: return "Failed to convert Signal message to Loki message."
-            }
-        }
+        @objc public static let proofOfWorkCalculationFailed = LokiAPIError(domain: "LokiAPIErrorDomain", code: 1, userInfo: [ NSLocalizedDescriptionKey : "Failed to calculate proof of work." ])
+        @objc public static let messageConversionFailed = LokiAPIError(domain: "LokiAPIErrorDomain", code: 2, userInfo: [ NSLocalizedDescriptionKey : "Failed to construct message." ])
+        @objc public static let clockOutOfSync = LokiAPIError(domain: "LokiAPIErrorDomain", code: 3, userInfo: [ NSLocalizedDescriptionKey : "Your clock is out of sync with the service node network." ])
+        @objc public static let randomSnodePoolUpdatingFailed = LokiAPIError(domain: "LokiAPIErrorDomain", code: 4, userInfo: [ NSLocalizedDescriptionKey : "Failed to update random service node pool." ])
     }
     
     @objc(LKDestination)
@@ -74,6 +84,7 @@ public final class LokiAPI : NSObject {
     }
     
     public typealias MessageListPromise = Promise<[SSKProtoEnvelope]>
+    
     public typealias RawResponsePromise = Promise<RawResponse>
     
     // MARK: Lifecycle
@@ -82,7 +93,7 @@ public final class LokiAPI : NSObject {
     // MARK: Internal API
     internal static func invoke(_ method: LokiAPITarget.Method, on target: LokiAPITarget, associatedWith hexEncodedPublicKey: String,
         parameters: [String:Any], headers: [String:String]? = nil, timeout: TimeInterval? = nil) -> RawResponsePromise {
-        let url = URL(string: "\(target.address):\(target.port)/storage_rpc/\(version)")!
+        let url = URL(string: "\(target.address):\(target.port)/storage_rpc/\(apiVersion)")!
         let request = TSRequest(url: url, method: "POST", parameters: [ "method" : method.rawValue, "params" : parameters ])
         if let headers = headers { request.allHTTPHeaderFields = headers }
         request.timeoutInterval = timeout ?? defaultTimeout
@@ -110,9 +121,17 @@ public final class LokiAPI : NSObject {
     }
     
     public static func getDestinations(for hexEncodedPublicKey: String) -> Promise<[Destination]> {
+        var result: Promise<[Destination]>!
+        storage.dbReadConnection.readWrite { transaction in
+            result = getDestinations(for: hexEncodedPublicKey, in: transaction)
+        }
+        return result
+    }
+    
+    public static func getDestinations(for hexEncodedPublicKey: String, in transaction: YapDatabaseReadWriteTransaction) -> Promise<[Destination]> {
         let (promise, seal) = Promise<[Destination]>.pending()
-        func getDestinations() {
-            storage.dbReadConnection.read { transaction in
+        func getDestinations(in transaction: YapDatabaseReadTransaction? = nil) {
+            func getDestinationsInternal(in transaction: YapDatabaseReadTransaction) {
                 var destinations: [Destination] = []
                 let masterHexEncodedPublicKey = storage.getMasterHexEncodedPublicKey(for: hexEncodedPublicKey, in: transaction) ?? hexEncodedPublicKey
                 let masterDestination = Destination(hexEncodedPublicKey: masterHexEncodedPublicKey, kind: .master)
@@ -122,6 +141,13 @@ public final class LokiAPI : NSObject {
                 destinations.append(contentsOf: slaveDestinations)
                 seal.fulfill(destinations)
             }
+            if let transaction = transaction {
+                getDestinationsInternal(in: transaction)
+            } else {
+                storage.dbReadConnection.read { transaction in
+                    getDestinationsInternal(in: transaction)
+                }
+            }
         }
         let timeSinceLastUpdate: TimeInterval
         if let lastDeviceLinkUpdate = lastDeviceLinkUpdate[hexEncodedPublicKey] {
@@ -130,29 +156,27 @@ public final class LokiAPI : NSObject {
             timeSinceLastUpdate = .infinity
         }
         if timeSinceLastUpdate > deviceLinkUpdateInterval {
-            storage.dbReadConnection.read { transaction in
-                let masterHexEncodedPublicKey = storage.getMasterHexEncodedPublicKey(for: hexEncodedPublicKey, in: transaction) ?? hexEncodedPublicKey
-                LokiFileServerAPI.getDeviceLinks(associatedWith: masterHexEncodedPublicKey).done(on: DispatchQueue.global()) { _ in
-                    getDestinations()
+            let masterHexEncodedPublicKey = storage.getMasterHexEncodedPublicKey(for: hexEncodedPublicKey, in: transaction) ?? hexEncodedPublicKey
+            LokiFileServerAPI.getDeviceLinks(associatedWith: masterHexEncodedPublicKey, in: transaction).done(on: DispatchQueue.global()) { _ in
+                getDestinations()
+                lastDeviceLinkUpdate[hexEncodedPublicKey] = Date()
+            }.catch(on: DispatchQueue.global()) { error in
+                if (error as? LokiDotNetAPI.LokiDotNetAPIError) == LokiDotNetAPI.LokiDotNetAPIError.parsingFailed {
+                    // Don't immediately re-fetch in case of failure due to a parsing error
                     lastDeviceLinkUpdate[hexEncodedPublicKey] = Date()
-                }.catch(on: DispatchQueue.global()) { error in
-                    if (error as? LokiDotNetAPI.Error) == LokiDotNetAPI.Error.parsingFailed {
-                        // Don't immediately re-fetch in case of failure due to a parsing error
-                        lastDeviceLinkUpdate[hexEncodedPublicKey] = Date()
-                        getDestinations()
-                    } else {
-                        seal.reject(error)
-                    }
+                    getDestinations()
+                } else {
+                    seal.reject(error)
                 }
             }
         } else {
-            getDestinations()
+            getDestinations(in: transaction)
         }
         return promise
     }
     
     public static func sendSignalMessage(_ signalMessage: SignalMessage, onP2PSuccess: @escaping () -> Void) -> Promise<Set<RawResponsePromise>> {
-        guard let lokiMessage = LokiMessage.from(signalMessage: signalMessage) else { return Promise(error: Error.messageConversionFailed) }
+        guard let lokiMessage = LokiMessage.from(signalMessage: signalMessage) else { return Promise(error: LokiAPIError.messageConversionFailed) }
         let notificationCenter = NotificationCenter.default
         let destination = lokiMessage.destination
         func sendLokiMessage(_ lokiMessage: LokiMessage, to target: LokiAPITarget) -> RawResponsePromise {
@@ -207,6 +231,12 @@ public final class LokiAPI : NSObject {
     @objc(getDestinationsFor:)
     public static func objc_getDestinations(for hexEncodedPublicKey: String) -> AnyPromise {
         let promise = getDestinations(for: hexEncodedPublicKey)
+        return AnyPromise.from(promise)
+    }
+    
+    @objc(getDestinationsFor:inTransaction:)
+    public static func objc_getDestinations(for hexEncodedPublicKey: String, in transaction: YapDatabaseReadWriteTransaction) -> AnyPromise {
+        let promise = getDestinations(for: hexEncodedPublicKey, in: transaction)
         return AnyPromise.from(promise)
     }
     
@@ -296,7 +326,10 @@ public final class LokiAPI : NSObject {
             storage.setLastMessageHash(forServiceNode: target.address, hash: hashValue, expiresAt: expirationDate, transaction: transaction)
         }
     }
-
+    
+    private static let receivedMessageHashValuesKey = "receivedMessageHashValuesKey"
+    private static let receivedMessageHashValuesCollection = "receivedMessageHashValuesCollection"
+    
     private static func getReceivedMessageHashValues() -> Set<String>? {
         var result: Set<String>? = nil
         storage.dbReadConnection.read { transaction in

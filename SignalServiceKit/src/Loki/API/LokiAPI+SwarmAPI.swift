@@ -1,7 +1,5 @@
 import PromiseKit
 
-extension String : Error { }
-
 public extension LokiAPI {
     
     fileprivate static var failureCount: [LokiAPITarget:UInt] = [:]
@@ -9,26 +7,11 @@ public extension LokiAPI {
     // MARK: Settings
     private static let minimumSnodeCount = 2
     private static let targetSnodeCount = 3
+    private static let maxRandomSnodePoolSize = 1024
     fileprivate static let failureThreshold = 2
     
     // MARK: Caching
-    private static let swarmCacheKey = "swarmCacheKey"
-    private static let swarmCacheCollection = "swarmCacheCollection"
-    
-    internal static var swarmCache: [String:[LokiAPITarget]] {
-        get {
-            var result: [String:[LokiAPITarget]]? = nil
-            storage.dbReadConnection.read { transaction in
-                result = transaction.object(forKey: swarmCacheKey, inCollection: swarmCacheCollection) as! [String:[LokiAPITarget]]?
-            }
-            return result ?? [:]
-        }
-        set {
-            storage.dbReadWriteConnection.readWrite { transaction in
-                transaction.setObject(newValue, forKey: swarmCacheKey, inCollection: swarmCacheCollection)
-            }
-        }
-    }
+    internal static var swarmCache: [String:[LokiAPITarget]] = [:]
     
     internal static func dropIfNeeded(_ target: LokiAPITarget, hexEncodedPublicKey: String) {
         let swarm = LokiAPI.swarmCache[hexEncodedPublicKey]
@@ -55,7 +38,7 @@ public extension LokiAPI {
                 "method" : "get_n_service_nodes",
                 "params" : [
                     "active_only" : true,
-                    "limit" : 24,
+                    "limit" : maxRandomSnodePoolSize,
                     "fields" : [
                         "public_ip" : true,
                         "storage_port" : true,
@@ -67,7 +50,7 @@ public extension LokiAPI {
             print("[Loki] Invoking get_n_service_nodes on \(target).")
             return TSNetworkManager.shared().perform(request, withCompletionQueue: DispatchQueue.global()).map { intermediate in
                 let rawResponse = intermediate.responseObject
-                guard let json = rawResponse as? JSON, let intermediate = json["result"] as? JSON, let rawTargets = intermediate["service_node_states"] as? [JSON] else { throw "Failed to update random snode pool from: \(rawResponse)." }
+                guard let json = rawResponse as? JSON, let intermediate = json["result"] as? JSON, let rawTargets = intermediate["service_node_states"] as? [JSON] else { throw LokiAPIError.randomSnodePoolUpdatingFailed }
                 randomSnodePool = try Set(rawTargets.flatMap { rawTarget in
                     guard let address = rawTarget["public_ip"] as? String, let port = rawTarget["storage_port"] as? Int, let idKey = rawTarget["pubkey_ed25519"] as? String, let encryptionKey = rawTarget["pubkey_x25519"] as? String, address != "0.0.0.0" else {
                         print("[Loki] Failed to parse target from: \(rawTarget).")
@@ -75,6 +58,7 @@ public extension LokiAPI {
                     }
                     return LokiAPITarget(address: "https://\(address)", port: UInt16(port), publicKeySet: LokiAPITarget.KeySet(idKey: idKey, encryptionKey: encryptionKey))
                 })
+                // randomElement() uses the system's default random generator, which is cryptographically secure
                 return randomSnodePool.randomElement()!
             }.recover(on: DispatchQueue.global()) { error -> Promise<LokiAPITarget> in
                 print("[Loki] Failed to contact seed node at: \(target).")
@@ -82,6 +66,7 @@ public extension LokiAPI {
             }.retryingIfNeeded(maxRetryCount: 16) // The seed nodes have historically been unreliable
         } else {
             return Promise<LokiAPITarget> { seal in
+                // randomElement() uses the system's default random generator, which is cryptographically secure
                 seal.fulfill(randomSnodePool.randomElement()!)
             }
         }
@@ -137,6 +122,9 @@ internal extension Promise {
                         LokiAPI.randomSnodePool.remove(target) // Remove it from the random snode pool
                         LokiAPI.failureCount[target] = 0
                     }
+                case 406:
+                    print("[Loki] The user's clock is out of sync with the service node network.")
+                    throw LokiAPI.LokiAPIError.clockOutOfSync
                 case 421:
                     // The snode isn't associated with the given public key anymore
                     print("[Loki] Invalidating swarm for: \(hexEncodedPublicKey).")
